@@ -29,6 +29,7 @@ use super::{
     client_key_from_request, run_gateway_chat_with_tools, sanitize_gateway_response, AppState,
     RATE_LIMIT_WINDOW_SECS,
 };
+use crate::channels::traits::Channel;
 use crate::memory::MemoryCategory;
 use crate::providers;
 use axum::{
@@ -39,8 +40,41 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+/// Record LlmResponse + RequestLatency + AgentEnd observability events.
+fn record_completion(
+    state: &AppState,
+    provider: &str,
+    model: &str,
+    duration: Duration,
+    error: Option<&str>,
+) {
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::LlmResponse {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            duration,
+            success: error.is_none(),
+            error_message: error.map(String::from),
+            input_tokens: None,
+            output_tokens: None,
+        });
+    state
+        .observer
+        .record_metric(&crate::observability::traits::ObserverMetric::RequestLatency(duration));
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::AgentEnd {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            duration,
+            tokens_used: None,
+            cost_usd: None,
+        });
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // /api/chat — ZeroClaw-native endpoint
@@ -62,6 +96,13 @@ pub struct ApiChatBody {
     /// semantic memory might not surface (e.g., the last few exchanges).
     #[serde(default)]
     pub context: Vec<String>,
+
+    /// Optional reply channel context for direct delivery.
+    /// When present, ZeroClaw sends replies directly to the channel (e.g. Teams)
+    /// instead of returning them in the HTTP body.
+    /// Wire format: `"teams_context": { ... }` — preserved for router compatibility.
+    #[serde(default, rename = "teams_context")]
+    pub reply_channel: Option<serde_json::Value>,
 }
 
 fn api_chat_memory_key() -> String {
@@ -190,7 +231,82 @@ pub async fn handle_api_chat(
             messages_count: 1,
         });
 
-    // ── Run the full agent loop ──
+    // ── Channel direct reply path ──
+    // When a reply channel is present, send replies directly via the channel
+    // instead of returning them in the HTTP response body.
+    let reply_channel: Option<Box<dyn Channel>> = chat_body
+        .reply_channel
+        .as_ref()
+        .and_then(crate::channels::reply_channel_from_json);
+
+    if let Some(ref ch) = reply_channel {
+        let _ = ch.start_typing("").await;
+
+        let result = run_gateway_chat_with_tools(&state, &enriched_message, session_id).await;
+
+        let _ = ch.stop_typing("").await;
+
+        let duration = started_at.elapsed();
+
+        match result {
+            Ok(response) => {
+                let leak_guard_cfg = state.config.lock().security.outbound_leak_guard.clone();
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &leak_guard_cfg,
+                );
+
+                record_completion(&state, &provider_label, &model_label, duration, None);
+
+                let msg = crate::channels::SendMessage::new(&safe_response, "");
+                let send_result = ch.send(&msg).await;
+
+                if let Err(e) = send_result {
+                    tracing::error!("/api/chat channel direct reply failed: {e}");
+                    let err = serde_json::json!({
+                        "error": "Failed to deliver reply via channel",
+                        "reply": safe_response,
+                    });
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
+                }
+
+                let body = serde_json::json!({
+                    "delivered_via_channel": true,
+                    "model": state.model,
+                    "session_id": chat_body.session_id,
+                });
+                return (StatusCode::OK, Json(body));
+            }
+            Err(e) => {
+                let sanitized = providers::sanitize_api_error(&e.to_string());
+                record_completion(
+                    &state,
+                    &provider_label,
+                    &model_label,
+                    duration,
+                    Some(&sanitized),
+                );
+
+                tracing::error!("/api/chat provider error (channel path): {sanitized}");
+
+                // Best-effort error reply via channel
+                let msg = crate::channels::SendMessage::new(
+                    "Sorry, I couldn't process your message. Please try again.",
+                    "",
+                );
+                let _ = ch.send(&msg).await;
+
+                let err = serde_json::json!({
+                    "error": "LLM request failed",
+                    "delivered_via_channel": true,
+                });
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
+            }
+        }
+    }
+
+    // ── Run the full agent loop (non-channel path) ──
     match run_gateway_chat_with_tools(&state, &enriched_message, session_id).await {
         Ok(response) => {
             let leak_guard_cfg = state.config.lock().security.outbound_leak_guard.clone();
@@ -201,29 +317,7 @@ pub async fn handle_api_chat(
             );
             let duration = started_at.elapsed();
 
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::LlmResponse {
-                    provider: provider_label.clone(),
-                    model: model_label.clone(),
-                    duration,
-                    success: true,
-                    error_message: None,
-                    input_tokens: None,
-                    output_tokens: None,
-                });
-            state.observer.record_metric(
-                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
-            );
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::AgentEnd {
-                    provider: provider_label,
-                    model: model_label,
-                    duration,
-                    tokens_used: None,
-                    cost_usd: None,
-                });
+            record_completion(&state, &provider_label, &model_label, duration, None);
 
             let body = serde_json::json!({
                 "reply": safe_response,
@@ -236,29 +330,13 @@ pub async fn handle_api_chat(
             let duration = started_at.elapsed();
             let sanitized = providers::sanitize_api_error(&e.to_string());
 
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::LlmResponse {
-                    provider: provider_label.clone(),
-                    model: model_label.clone(),
-                    duration,
-                    success: false,
-                    error_message: Some(sanitized.clone()),
-                    input_tokens: None,
-                    output_tokens: None,
-                });
-            state.observer.record_metric(
-                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+            record_completion(
+                &state,
+                &provider_label,
+                &model_label,
+                duration,
+                Some(&sanitized),
             );
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::AgentEnd {
-                    provider: provider_label,
-                    model: model_label,
-                    duration,
-                    tokens_used: None,
-                    cost_usd: None,
-                });
 
             tracing::error!("/api/chat provider error: {sanitized}");
             let err = serde_json::json!({"error": "LLM request failed"});
@@ -774,6 +852,7 @@ mod tests {
         assert_eq!(body.message, "Hello");
         assert!(body.session_id.is_none());
         assert!(body.context.is_empty());
+        assert!(body.reply_channel.is_none());
     }
 
     #[test]
@@ -787,6 +866,34 @@ mod tests {
         assert_eq!(body.message, "What's my schedule?");
         assert_eq!(body.session_id.as_deref(), Some("sess-123"));
         assert_eq!(body.context.len(), 2);
+        assert!(body.reply_channel.is_none());
+    }
+
+    #[test]
+    fn api_chat_body_deserializes_with_reply_channel() {
+        // Wire key is "teams_context" (serde rename); field is reply_channel.
+        let json = r#"{
+            "message": "What's my schedule?",
+            "session_id": "conv-123",
+            "teams_context": {
+                "service_url": "https://smba.example.com/",
+                "conversation_id": "conv-123",
+                "activity_id": "act-456",
+                "bot_id": "bot-789",
+                "bot_name": "ZeroClawAgent",
+                "user_id": "user-abc",
+                "user_name": "Test User",
+                "app_id": "app-id",
+                "app_password": "app-password",
+                "app_tenant_id": "tenant-xyz"
+            }
+        }"#;
+        let body: ApiChatBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.message, "What's my schedule?");
+        let rc = body.reply_channel.unwrap();
+        assert_eq!(rc["service_url"], "https://smba.example.com/");
+        assert_eq!(rc["conversation_id"], "conv-123");
+        assert_eq!(rc["app_id"], "app-id");
     }
 
     #[test]
