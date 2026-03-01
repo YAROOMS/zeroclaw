@@ -40,8 +40,41 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+/// Record LlmResponse + RequestLatency + AgentEnd observability events.
+fn record_completion(
+    state: &AppState,
+    provider: &str,
+    model: &str,
+    duration: Duration,
+    error: Option<&str>,
+) {
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::LlmResponse {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            duration,
+            success: error.is_none(),
+            error_message: error.map(String::from),
+            input_tokens: None,
+            output_tokens: None,
+        });
+    state.observer.record_metric(
+        &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+    );
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::AgentEnd {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            duration,
+            tokens_used: None,
+            cost_usd: None,
+        });
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // /api/chat — ZeroClaw-native endpoint
@@ -220,29 +253,7 @@ pub async fn handle_api_chat(
                     &leak_guard_cfg,
                 );
 
-                state
-                    .observer
-                    .record_event(&crate::observability::ObserverEvent::LlmResponse {
-                        provider: provider_label.clone(),
-                        model: model_label.clone(),
-                        duration,
-                        success: true,
-                        error_message: None,
-                        input_tokens: None,
-                        output_tokens: None,
-                    });
-                state.observer.record_metric(
-                    &crate::observability::traits::ObserverMetric::RequestLatency(duration),
-                );
-                state
-                    .observer
-                    .record_event(&crate::observability::ObserverEvent::AgentEnd {
-                        provider: provider_label,
-                        model: model_label,
-                        duration,
-                        tokens_used: None,
-                        cost_usd: None,
-                    });
+                record_completion(&state, &provider_label, &model_label, duration, None);
 
                 // Send reply directly to Teams — detect Adaptive Cards
                 let send_result = if let Some((card, remaining)) =
@@ -277,30 +288,7 @@ pub async fn handle_api_chat(
             }
             Err(e) => {
                 let sanitized = providers::sanitize_api_error(&e.to_string());
-
-                state
-                    .observer
-                    .record_event(&crate::observability::ObserverEvent::LlmResponse {
-                        provider: provider_label.clone(),
-                        model: model_label.clone(),
-                        duration,
-                        success: false,
-                        error_message: Some(sanitized.clone()),
-                        input_tokens: None,
-                        output_tokens: None,
-                    });
-                state.observer.record_metric(
-                    &crate::observability::traits::ObserverMetric::RequestLatency(duration),
-                );
-                state
-                    .observer
-                    .record_event(&crate::observability::ObserverEvent::AgentEnd {
-                        provider: provider_label,
-                        model: model_label,
-                        duration,
-                        tokens_used: None,
-                        cost_usd: None,
-                    });
+                record_completion(&state, &provider_label, &model_label, duration, Some(&sanitized));
 
                 tracing::error!("/api/chat provider error (Teams path): {sanitized}");
 
@@ -331,29 +319,7 @@ pub async fn handle_api_chat(
             );
             let duration = started_at.elapsed();
 
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::LlmResponse {
-                    provider: provider_label.clone(),
-                    model: model_label.clone(),
-                    duration,
-                    success: true,
-                    error_message: None,
-                    input_tokens: None,
-                    output_tokens: None,
-                });
-            state.observer.record_metric(
-                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
-            );
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::AgentEnd {
-                    provider: provider_label,
-                    model: model_label,
-                    duration,
-                    tokens_used: None,
-                    cost_usd: None,
-                });
+            record_completion(&state, &provider_label, &model_label, duration, None);
 
             let body = serde_json::json!({
                 "reply": safe_response,
@@ -366,29 +332,7 @@ pub async fn handle_api_chat(
             let duration = started_at.elapsed();
             let sanitized = providers::sanitize_api_error(&e.to_string());
 
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::LlmResponse {
-                    provider: provider_label.clone(),
-                    model: model_label.clone(),
-                    duration,
-                    success: false,
-                    error_message: Some(sanitized.clone()),
-                    input_tokens: None,
-                    output_tokens: None,
-                });
-            state.observer.record_metric(
-                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
-            );
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::AgentEnd {
-                    provider: provider_label,
-                    model: model_label,
-                    duration,
-                    tokens_used: None,
-                    cost_usd: None,
-                });
+            record_completion(&state, &provider_label, &model_label, duration, Some(&sanitized));
 
             tracing::error!("/api/chat provider error: {sanitized}");
             let err = serde_json::json!({"error": "LLM request failed"});

@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// Teams conversation context passed from the router in the `/api/chat` body.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct TeamsContext {
     pub service_url: String,
     pub conversation_id: String,
@@ -52,6 +52,23 @@ pub struct TeamsContext {
     pub app_id: String,
     pub app_password: String,
     pub app_tenant_id: Option<String>,
+}
+
+impl std::fmt::Debug for TeamsContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TeamsContext")
+            .field("service_url", &self.service_url)
+            .field("conversation_id", &self.conversation_id)
+            .field("activity_id", &self.activity_id)
+            .field("bot_id", &self.bot_id)
+            .field("bot_name", &self.bot_name)
+            .field("user_id", &self.user_id)
+            .field("user_name", &self.user_name)
+            .field("app_id", &self.app_id)
+            .field("app_password", &"[REDACTED]")
+            .field("app_tenant_id", &self.app_tenant_id)
+            .finish()
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -149,6 +166,15 @@ impl Channel for TeamsChannel {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// Shared HTTP client
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Returns a cached HTTP client with proxy configuration.
+fn http_client() -> reqwest::Client {
+    crate::config::build_runtime_proxy_client("channel.teams")
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // OAuth token cache
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -196,8 +222,7 @@ async fn get_bot_token(
         tenant
     );
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = http_client()
         .post(&token_url)
         .form(&[
             ("grant_type", "client_credentials"),
@@ -277,54 +302,85 @@ struct ActivityAccount {
 #[derive(Serialize)]
 struct CardAttachment {
     #[serde(rename = "contentType")]
-    content_type: String,
+    content_type: &'static str,
     content: serde_json::Value,
+}
+
+/// Response from Bot Framework when creating/sending an activity.
+#[derive(Deserialize)]
+struct SendResponse {
+    id: Option<String>,
+}
+
+/// POST or PUT a Bot Framework activity. Returns the response.
+async fn post_activity(
+    ctx: &TeamsContext,
+    url: &str,
+    activity: &BotActivity,
+    method: reqwest::Method,
+    timeout: Duration,
+    context_msg: &'static str,
+) -> Result<reqwest::Response> {
+    let token = get_bot_token(&ctx.app_id, &ctx.app_password, ctx.app_tenant_id.as_deref()).await?;
+
+    let resp = http_client()
+        .request(method, url)
+        .bearer_auth(&token)
+        .json(activity)
+        .timeout(timeout)
+        .send()
+        .await
+        .context(context_msg)?;
+
+    Ok(resp)
+}
+
+/// Build the activities URL for a conversation.
+fn activities_url(ctx: &TeamsContext) -> String {
+    let base_url = normalize_service_url(&ctx.service_url);
+    format!("{}/v3/conversations/{}/activities", base_url, ctx.conversation_id)
+}
+
+/// Build the `from` account for activities.
+fn bot_account(ctx: &TeamsContext) -> ActivityAccount {
+    ActivityAccount {
+        id: ctx.bot_id.clone().unwrap_or_default(),
+        name: ctx.bot_name.clone(),
+    }
+}
+
+/// Build the optional `recipient` account for activities.
+fn user_account(ctx: &TeamsContext) -> Option<ActivityAccount> {
+    ctx.user_id.as_ref().map(|id| ActivityAccount {
+        id: id.clone(),
+        name: ctx.user_name.clone(),
+    })
 }
 
 /// Send a text reply to a Teams conversation. Returns the activity ID.
 pub async fn send_reply(ctx: &TeamsContext, text: &str) -> Result<String> {
-    let token = get_bot_token(&ctx.app_id, &ctx.app_password, ctx.app_tenant_id.as_deref()).await?;
-    let base_url = normalize_service_url(&ctx.service_url);
-    let url = format!(
-        "{}/v3/conversations/{}/activities",
-        base_url, ctx.conversation_id
-    );
-
+    let url = activities_url(ctx);
     let activity = BotActivity {
         r#type: "message",
         text: Some(text.to_string()),
         text_format: Some("markdown"),
         attachments: None,
-        from: ActivityAccount {
-            id: ctx.bot_id.clone().unwrap_or_default(),
-            name: ctx.bot_name.clone(),
-        },
-        recipient: ctx.user_id.as_ref().map(|id| ActivityAccount {
-            id: id.clone(),
-            name: ctx.user_name.clone(),
-        }),
+        from: bot_account(ctx),
+        recipient: user_account(ctx),
         reply_to_id: ctx.activity_id.clone(),
     };
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .bearer_auth(&token)
-        .json(&activity)
-        .timeout(Duration::from_secs(15))
-        .send()
-        .await
-        .context("Failed to send Teams reply")?;
+    let resp = post_activity(
+        ctx, &url, &activity,
+        reqwest::Method::POST,
+        Duration::from_secs(15),
+        "Failed to send Teams reply",
+    ).await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         bail!("Teams send_reply returned {status}: {body}");
-    }
-
-    #[derive(Deserialize)]
-    struct SendResponse {
-        id: Option<String>,
     }
 
     let send_resp: SendResponse = resp
@@ -337,51 +393,31 @@ pub async fn send_reply(ctx: &TeamsContext, text: &str) -> Result<String> {
 
 /// Send an Adaptive Card reply to a Teams conversation. Returns the activity ID.
 pub async fn send_card_activity(ctx: &TeamsContext, card: serde_json::Value) -> Result<String> {
-    let token = get_bot_token(&ctx.app_id, &ctx.app_password, ctx.app_tenant_id.as_deref()).await?;
-    let base_url = normalize_service_url(&ctx.service_url);
-    let url = format!(
-        "{}/v3/conversations/{}/activities",
-        base_url, ctx.conversation_id
-    );
-
+    let url = activities_url(ctx);
     let activity = BotActivity {
         r#type: "message",
         text: None,
         text_format: None,
         attachments: Some(vec![CardAttachment {
-            content_type: "application/vnd.microsoft.card.adaptive".to_string(),
+            content_type: "application/vnd.microsoft.card.adaptive",
             content: card,
         }]),
-        from: ActivityAccount {
-            id: ctx.bot_id.clone().unwrap_or_default(),
-            name: ctx.bot_name.clone(),
-        },
-        recipient: ctx.user_id.as_ref().map(|id| ActivityAccount {
-            id: id.clone(),
-            name: ctx.user_name.clone(),
-        }),
+        from: bot_account(ctx),
+        recipient: user_account(ctx),
         reply_to_id: ctx.activity_id.clone(),
     };
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .bearer_auth(&token)
-        .json(&activity)
-        .timeout(Duration::from_secs(15))
-        .send()
-        .await
-        .context("Failed to send Teams card")?;
+    let resp = post_activity(
+        ctx, &url, &activity,
+        reqwest::Method::POST,
+        Duration::from_secs(15),
+        "Failed to send Teams card",
+    ).await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         bail!("Teams send_card returned {status}: {body}");
-    }
-
-    #[derive(Deserialize)]
-    struct SendResponse {
-        id: Option<String>,
     }
 
     let send_resp: SendResponse = resp
@@ -394,7 +430,6 @@ pub async fn send_card_activity(ctx: &TeamsContext, card: serde_json::Value) -> 
 
 /// Update an existing message in a Teams conversation.
 pub async fn update_activity(ctx: &TeamsContext, activity_id: &str, text: &str) -> Result<()> {
-    let token = get_bot_token(&ctx.app_id, &ctx.app_password, ctx.app_tenant_id.as_deref()).await?;
     let base_url = normalize_service_url(&ctx.service_url);
     let url = format!(
         "{}/v3/conversations/{}/activities/{}",
@@ -406,23 +441,17 @@ pub async fn update_activity(ctx: &TeamsContext, activity_id: &str, text: &str) 
         text: Some(text.to_string()),
         text_format: Some("markdown"),
         attachments: None,
-        from: ActivityAccount {
-            id: ctx.bot_id.clone().unwrap_or_default(),
-            name: ctx.bot_name.clone(),
-        },
+        from: bot_account(ctx),
         recipient: None,
         reply_to_id: None,
     };
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .put(&url)
-        .bearer_auth(&token)
-        .json(&activity)
-        .timeout(Duration::from_secs(15))
-        .send()
-        .await
-        .context("Failed to update Teams activity")?;
+    let resp = post_activity(
+        ctx, &url, &activity,
+        reqwest::Method::PUT,
+        Duration::from_secs(15),
+        "Failed to update Teams activity",
+    ).await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -435,38 +464,23 @@ pub async fn update_activity(ctx: &TeamsContext, activity_id: &str, text: &str) 
 
 /// Send a typing indicator to a Teams conversation.
 pub async fn send_typing(ctx: &TeamsContext) -> Result<()> {
-    let token = get_bot_token(&ctx.app_id, &ctx.app_password, ctx.app_tenant_id.as_deref()).await?;
-    let base_url = normalize_service_url(&ctx.service_url);
-    let url = format!(
-        "{}/v3/conversations/{}/activities",
-        base_url, ctx.conversation_id
-    );
-
+    let url = activities_url(ctx);
     let activity = BotActivity {
         r#type: "typing",
         text: None,
         text_format: None,
         attachments: None,
-        from: ActivityAccount {
-            id: ctx.bot_id.clone().unwrap_or_default(),
-            name: ctx.bot_name.clone(),
-        },
-        recipient: ctx.user_id.as_ref().map(|id| ActivityAccount {
-            id: id.clone(),
-            name: ctx.user_name.clone(),
-        }),
+        from: bot_account(ctx),
+        recipient: user_account(ctx),
         reply_to_id: None,
     };
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .bearer_auth(&token)
-        .json(&activity)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .context("Failed to send Teams typing indicator")?;
+    let resp = post_activity(
+        ctx, &url, &activity,
+        reqwest::Method::POST,
+        Duration::from_secs(10),
+        "Failed to send Teams typing indicator",
+    ).await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -553,6 +567,25 @@ mod tests {
     }
 
     #[test]
+    fn teams_context_debug_redacts_password() {
+        let ctx = TeamsContext {
+            service_url: "https://example.com".to_string(),
+            conversation_id: "conv".to_string(),
+            activity_id: None,
+            bot_id: None,
+            bot_name: None,
+            user_id: None,
+            user_name: None,
+            app_id: "id".to_string(),
+            app_password: "super-secret-password".to_string(),
+            app_tenant_id: None,
+        };
+        let debug_output = format!("{:?}", ctx);
+        assert!(!debug_output.contains("super-secret-password"));
+        assert!(debug_output.contains("[REDACTED]"));
+    }
+
+    #[test]
     fn bot_activity_serializes_text_message() {
         let activity = BotActivity {
             r#type: "message",
@@ -609,7 +642,7 @@ mod tests {
             text: None,
             text_format: None,
             attachments: Some(vec![CardAttachment {
-                content_type: "application/vnd.microsoft.card.adaptive".to_string(),
+                content_type: "application/vnd.microsoft.card.adaptive",
                 content: card.clone(),
             }]),
             from: ActivityAccount {

@@ -1547,11 +1547,6 @@ pub struct GatewayConfig {
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
 
-    /// HTTP request timeout in seconds (default: 30).
-    /// Set higher for long-running agent loops (e.g., Teams with tool calls).
-    #[serde(default = "default_gateway_request_timeout_secs")]
-    pub request_timeout_secs: u64,
-
     /// Node-control protocol scaffold (`[gateway.node_control]`).
     #[serde(default)]
     pub node_control: NodeControlConfig,
@@ -1599,10 +1594,6 @@ fn default_gateway_rate_limit_max_keys() -> usize {
     10_000
 }
 
-fn default_gateway_request_timeout_secs() -> u64 {
-    30
-}
-
 fn default_gateway_idempotency_max_keys() -> usize {
     10_000
 }
@@ -1625,7 +1616,6 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
-            request_timeout_secs: default_gateway_request_timeout_secs(),
             node_control: NodeControlConfig::default(),
         }
     }
