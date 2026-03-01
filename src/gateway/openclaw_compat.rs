@@ -26,10 +26,10 @@
 //! have migrated to the native endpoint.
 
 use super::{
-    client_key_from_request, run_gateway_chat_with_tools, sanitize_gateway_response,
-    teams_reply::{self, TeamsContext},
-    AppState, RATE_LIMIT_WINDOW_SECS,
+    client_key_from_request, run_gateway_chat_with_tools, sanitize_gateway_response, AppState,
+    RATE_LIMIT_WINDOW_SECS,
 };
+use crate::channels::traits::Channel;
 use crate::memory::MemoryCategory;
 use crate::providers;
 use axum::{
@@ -62,9 +62,9 @@ fn record_completion(
             input_tokens: None,
             output_tokens: None,
         });
-    state.observer.record_metric(
-        &crate::observability::traits::ObserverMetric::RequestLatency(duration),
-    );
+    state
+        .observer
+        .record_metric(&crate::observability::traits::ObserverMetric::RequestLatency(duration));
     state
         .observer
         .record_event(&crate::observability::ObserverEvent::AgentEnd {
@@ -97,11 +97,12 @@ pub struct ApiChatBody {
     #[serde(default)]
     pub context: Vec<String>,
 
-    /// Optional Teams context for direct reply delivery.
-    /// When present, ZeroClaw sends replies directly to Teams via the
-    /// Bot Framework REST API instead of returning them in the HTTP body.
-    #[serde(default)]
-    pub teams_context: Option<TeamsContext>,
+    /// Optional reply channel context for direct delivery.
+    /// When present, ZeroClaw sends replies directly to the channel (e.g. Teams)
+    /// instead of returning them in the HTTP body.
+    /// Wire format: `"teams_context": { ... }` — preserved for router compatibility.
+    #[serde(default, rename = "teams_context")]
+    pub reply_channel: Option<serde_json::Value>,
 }
 
 fn api_chat_memory_key() -> String {
@@ -230,17 +231,20 @@ pub async fn handle_api_chat(
             messages_count: 1,
         });
 
-    // ── Teams direct reply path ──
-    // When teams_context is present, send replies directly to Teams via Bot
-    // Framework REST API instead of returning them in the HTTP response body.
-    if let Some(ref teams_ctx) = chat_body.teams_context {
-        // Start typing indicator (repeats every 3s until aborted)
-        let typing_handle = teams_reply::spawn_typing_loop(teams_ctx.clone());
+    // ── Channel direct reply path ──
+    // When a reply channel is present, send replies directly via the channel
+    // instead of returning them in the HTTP response body.
+    let reply_channel: Option<Box<dyn Channel>> = chat_body
+        .reply_channel
+        .as_ref()
+        .and_then(crate::channels::reply_channel_from_json);
+
+    if let Some(ref ch) = reply_channel {
+        let _ = ch.start_typing("").await;
 
         let result = run_gateway_chat_with_tools(&state, &enriched_message, session_id).await;
 
-        // Stop typing
-        typing_handle.abort();
+        let _ = ch.stop_typing("").await;
 
         let duration = started_at.elapsed();
 
@@ -255,25 +259,13 @@ pub async fn handle_api_chat(
 
                 record_completion(&state, &provider_label, &model_label, duration, None);
 
-                // Send reply directly to Teams — detect Adaptive Cards
-                let send_result = if let Some((card, remaining)) =
-                    extract_adaptive_card(&safe_response)
-                {
-                    tracing::info!("/api/chat sending Adaptive Card to Teams");
-                    let card_result = teams_reply::send_card(teams_ctx, card).await;
-                    // Send any remaining text (before/after the card) as a follow-up
-                    if card_result.is_ok() && !remaining.is_empty() {
-                        let _ = teams_reply::send_reply(teams_ctx, &remaining).await;
-                    }
-                    card_result
-                } else {
-                    teams_reply::send_reply(teams_ctx, &safe_response).await
-                };
+                let msg = crate::channels::SendMessage::new(&safe_response, "");
+                let send_result = ch.send(&msg).await;
 
                 if let Err(e) = send_result {
-                    tracing::error!("/api/chat Teams direct reply failed: {e}");
+                    tracing::error!("/api/chat channel direct reply failed: {e}");
                     let err = serde_json::json!({
-                        "error": "Failed to deliver reply to Teams",
+                        "error": "Failed to deliver reply via channel",
                         "reply": safe_response,
                     });
                     return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
@@ -288,16 +280,22 @@ pub async fn handle_api_chat(
             }
             Err(e) => {
                 let sanitized = providers::sanitize_api_error(&e.to_string());
-                record_completion(&state, &provider_label, &model_label, duration, Some(&sanitized));
+                record_completion(
+                    &state,
+                    &provider_label,
+                    &model_label,
+                    duration,
+                    Some(&sanitized),
+                );
 
-                tracing::error!("/api/chat provider error (Teams path): {sanitized}");
+                tracing::error!("/api/chat provider error (channel path): {sanitized}");
 
-                // Best-effort error reply to Teams
-                let _ = teams_reply::send_reply(
-                    teams_ctx,
+                // Best-effort error reply via channel
+                let msg = crate::channels::SendMessage::new(
                     "Sorry, I couldn't process your message. Please try again.",
-                )
-                .await;
+                    "",
+                );
+                let _ = ch.send(&msg).await;
 
                 let err = serde_json::json!({
                     "error": "LLM request failed",
@@ -308,7 +306,7 @@ pub async fn handle_api_chat(
         }
     }
 
-    // ── Run the full agent loop (non-Teams path) ──
+    // ── Run the full agent loop (non-channel path) ──
     match run_gateway_chat_with_tools(&state, &enriched_message, session_id).await {
         Ok(response) => {
             let leak_guard_cfg = state.config.lock().security.outbound_leak_guard.clone();
@@ -332,7 +330,13 @@ pub async fn handle_api_chat(
             let duration = started_at.elapsed();
             let sanitized = providers::sanitize_api_error(&e.to_string());
 
-            record_completion(&state, &provider_label, &model_label, duration, Some(&sanitized));
+            record_completion(
+                &state,
+                &provider_label,
+                &model_label,
+                duration,
+                Some(&sanitized),
+            );
 
             tracing::error!("/api/chat provider error: {sanitized}");
             let err = serde_json::json!({"error": "LLM request failed"});
@@ -833,74 +837,6 @@ fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
-/// Try to extract an Adaptive Card JSON from the agent response text.
-///
-/// LLMs return Adaptive Cards in various forms:
-/// 1. Raw JSON: `{"type": "AdaptiveCard", ...}`
-/// 2. Wrapped in a markdown code block: ````json\n{...}\n````
-/// 3. Code block with surrounding text: `Here's your card:\n```json\n{...}\n```\nEnjoy!`
-///
-/// Returns `Some((card_json, remaining_text))` if found.
-/// `remaining_text` is any text outside the code block (may be empty).
-fn extract_adaptive_card(text: &str) -> Option<(serde_json::Value, String)> {
-    let trimmed = text.trim();
-
-    // Try raw JSON first (entire response is the card)
-    if let Some(card) = try_parse_adaptive_card(trimmed) {
-        return Some((card, String::new()));
-    }
-
-    // Find a markdown code block anywhere in the text and check if it's an Adaptive Card.
-    // Scan for ``` boundaries — handles ```json, ```, etc.
-    let mut search_from = 0;
-    while let Some(start) = trimmed[search_from..].find("```") {
-        let abs_start = search_from + start;
-        // Skip past the opening ``` and any language tag (e.g., "json")
-        let after_backticks = abs_start + 3;
-        // Find the end of the opening line (language hint)
-        let content_start = trimmed[after_backticks..]
-            .find('\n')
-            .map(|i| after_backticks + i + 1)
-            .unwrap_or(after_backticks);
-
-        // Find closing ```
-        if let Some(end_offset) = trimmed[content_start..].find("```") {
-            let content_end = content_start + end_offset;
-            let inner = trimmed[content_start..content_end].trim();
-
-            if let Some(card) = try_parse_adaptive_card(inner) {
-                // Collect text before and after the code block
-                let block_end = content_end + 3;
-                let before = trimmed[..abs_start].trim();
-                let after = trimmed[block_end..].trim();
-                let remaining = match (before.is_empty(), after.is_empty()) {
-                    (true, true) => String::new(),
-                    (false, true) => before.to_string(),
-                    (true, false) => after.to_string(),
-                    (false, false) => format!("{before}\n{after}"),
-                };
-                return Some((card, remaining));
-            }
-
-            // Not an Adaptive Card, keep searching after this block
-            search_from = content_end + 3;
-        } else {
-            break;
-        }
-    }
-
-    None
-}
-
-fn try_parse_adaptive_card(text: &str) -> Option<serde_json::Value> {
-    let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    if value.get("type")?.as_str()? == "AdaptiveCard" {
-        Some(value)
-    } else {
-        None
-    }
-}
-
 // ══════════════════════════════════════════════════════════════════════════════
 // TESTS
 // ══════════════════════════════════════════════════════════════════════════════
@@ -916,7 +852,7 @@ mod tests {
         assert_eq!(body.message, "Hello");
         assert!(body.session_id.is_none());
         assert!(body.context.is_empty());
-        assert!(body.teams_context.is_none());
+        assert!(body.reply_channel.is_none());
     }
 
     #[test]
@@ -930,20 +866,21 @@ mod tests {
         assert_eq!(body.message, "What's my schedule?");
         assert_eq!(body.session_id.as_deref(), Some("sess-123"));
         assert_eq!(body.context.len(), 2);
-        assert!(body.teams_context.is_none());
+        assert!(body.reply_channel.is_none());
     }
 
     #[test]
-    fn api_chat_body_deserializes_with_teams_context() {
+    fn api_chat_body_deserializes_with_reply_channel() {
+        // Wire key is "teams_context" (serde rename); field is reply_channel.
         let json = r#"{
             "message": "What's my schedule?",
             "session_id": "conv-123",
             "teams_context": {
-                "service_url": "https://smba.trafficmanager.net/teams/",
+                "service_url": "https://smba.example.com/",
                 "conversation_id": "conv-123",
                 "activity_id": "act-456",
                 "bot_id": "bot-789",
-                "bot_name": "Yarvis",
+                "bot_name": "ZeroClawAgent",
                 "user_id": "user-abc",
                 "user_name": "Test User",
                 "app_id": "app-id",
@@ -953,11 +890,10 @@ mod tests {
         }"#;
         let body: ApiChatBody = serde_json::from_str(json).unwrap();
         assert_eq!(body.message, "What's my schedule?");
-        let ctx = body.teams_context.unwrap();
-        assert_eq!(ctx.service_url, "https://smba.trafficmanager.net/teams/");
-        assert_eq!(ctx.conversation_id, "conv-123");
-        assert_eq!(ctx.app_id, "app-id");
-        assert_eq!(ctx.bot_name.as_deref(), Some("Yarvis"));
+        let rc = body.reply_channel.unwrap();
+        assert_eq!(rc["service_url"], "https://smba.example.com/");
+        assert_eq!(rc["conversation_id"], "conv-123");
+        assert_eq!(rc["app_id"], "app-id");
     }
 
     #[test]
@@ -1035,63 +971,6 @@ mod tests {
         let k2 = api_chat_memory_key();
         assert_ne!(k1, k2);
         assert!(k1.starts_with("api_chat_msg_"));
-    }
-
-    // ── Adaptive Card extraction tests ──
-
-    #[test]
-    fn extract_adaptive_card_raw_json() {
-        let text = r#"{"type": "AdaptiveCard", "version": "1.5", "body": []}"#;
-        let (card, remaining) = extract_adaptive_card(text).unwrap();
-        assert_eq!(card["type"], "AdaptiveCard");
-        assert_eq!(card["version"], "1.5");
-        assert!(remaining.is_empty());
-    }
-
-    #[test]
-    fn extract_adaptive_card_markdown_code_block() {
-        let text = "```json\n{\"type\": \"AdaptiveCard\", \"version\": \"1.5\", \"body\": []}\n```";
-        let (card, remaining) = extract_adaptive_card(text).unwrap();
-        assert_eq!(card["type"], "AdaptiveCard");
-        assert!(remaining.is_empty());
-    }
-
-    #[test]
-    fn extract_adaptive_card_plain_code_block() {
-        let text = "```\n{\"type\": \"AdaptiveCard\", \"version\": \"1.5\", \"body\": []}\n```";
-        let (card, remaining) = extract_adaptive_card(text).unwrap();
-        assert_eq!(card["type"], "AdaptiveCard");
-        assert!(remaining.is_empty());
-    }
-
-    #[test]
-    fn extract_adaptive_card_with_surrounding_text() {
-        let text = "Here's your card:\n```json\n{\"type\": \"AdaptiveCard\", \"version\": \"1.5\", \"body\": []}\n```\nUpdated the title!";
-        let (card, remaining) = extract_adaptive_card(text).unwrap();
-        assert_eq!(card["type"], "AdaptiveCard");
-        assert_eq!(remaining, "Here's your card:\nUpdated the title!");
-    }
-
-    #[test]
-    fn extract_adaptive_card_text_only_after() {
-        let text = "```json\n{\"type\": \"AdaptiveCard\", \"version\": \"1.5\", \"body\": []}\n```\nEnjoy!";
-        let (card, remaining) = extract_adaptive_card(text).unwrap();
-        assert_eq!(card["type"], "AdaptiveCard");
-        assert_eq!(remaining, "Enjoy!");
-    }
-
-    #[test]
-    fn extract_adaptive_card_not_a_card() {
-        assert!(extract_adaptive_card("Hello, how can I help?").is_none());
-        assert!(extract_adaptive_card(r#"{"type": "other", "data": 1}"#).is_none());
-        assert!(extract_adaptive_card("```json\n{\"key\": \"value\"}\n```").is_none());
-    }
-
-    #[test]
-    fn extract_adaptive_card_with_whitespace() {
-        let text = "  \n{\"type\": \"AdaptiveCard\", \"version\": \"1.5\", \"body\": []}\n  ";
-        let (card, _) = extract_adaptive_card(text).unwrap();
-        assert_eq!(card["type"], "AdaptiveCard");
     }
 
     // ── Handler-level validation tests ──

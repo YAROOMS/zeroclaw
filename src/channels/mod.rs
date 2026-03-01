@@ -72,6 +72,14 @@ pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use teams::TeamsChannel;
 pub use telegram::TelegramChannel;
+
+/// Construct a per-request reply channel from an opaque JSON blob.
+///
+/// The gateway passes an opaque JSON value (e.g. `teams_context` from the router)
+/// and this factory resolves it to a concrete `Channel` implementation.
+pub fn reply_channel_from_json(value: &serde_json::Value) -> Option<Box<dyn Channel>> {
+    teams::TeamsChannel::try_from_reply_channel(value)
+}
 pub use traits::{Channel, SendMessage};
 pub use wati::WatiChannel;
 pub use whatsapp::WhatsAppChannel;

@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // TeamsContext — per-request conversation context
@@ -82,12 +83,16 @@ impl std::fmt::Debug for TeamsContext {
 /// updates through the standard channel interface.
 pub struct TeamsChannel {
     ctx: TeamsContext,
+    typing_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl TeamsChannel {
     /// Create a new Teams channel from a per-request context.
     pub fn new(ctx: TeamsContext) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            typing_handle: Mutex::new(None),
+        }
     }
 
     /// Access the underlying context.
@@ -101,6 +106,18 @@ impl TeamsChannel {
     pub async fn send_card(&self, card: serde_json::Value) -> Result<String> {
         send_card_activity(&self.ctx, card).await
     }
+
+    /// Construct a `TeamsChannel` from an opaque JSON blob (the reply channel payload).
+    ///
+    /// Returns `None` if the JSON doesn't deserialize into a valid `TeamsContext`
+    /// or if required fields are empty.
+    pub fn try_from_reply_channel(value: &serde_json::Value) -> Option<Box<dyn Channel>> {
+        let ctx: TeamsContext = serde_json::from_value(value.clone()).ok()?;
+        if ctx.service_url.is_empty() || ctx.app_id.is_empty() {
+            return None;
+        }
+        Some(Box::new(TeamsChannel::new(ctx)))
+    }
 }
 
 #[async_trait]
@@ -110,7 +127,14 @@ impl Channel for TeamsChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        send_reply(&self.ctx, &message.content).await?;
+        if let Some((card, remaining)) = extract_adaptive_card(&message.content) {
+            send_card_activity(&self.ctx, card).await?;
+            if !remaining.is_empty() {
+                send_reply(&self.ctx, &remaining).await?;
+            }
+        } else {
+            send_reply(&self.ctx, &message.content).await?;
+        }
         Ok(())
     }
 
@@ -128,11 +152,15 @@ impl Channel for TeamsChannel {
     }
 
     async fn start_typing(&self, _recipient: &str) -> Result<()> {
-        send_typing(&self.ctx).await
+        let handle = spawn_typing_loop(self.ctx.clone());
+        *self.typing_handle.lock() = Some(handle);
+        Ok(())
     }
 
     async fn stop_typing(&self, _recipient: &str) -> Result<()> {
-        // Teams typing indicators expire naturally after ~3 seconds.
+        if let Some(h) = self.typing_handle.lock().take() {
+            h.abort();
+        }
         Ok(())
     }
 
@@ -155,12 +183,7 @@ impl Channel for TeamsChannel {
         Ok(None) // Same message ID
     }
 
-    async fn finalize_draft(
-        &self,
-        _recipient: &str,
-        message_id: &str,
-        text: &str,
-    ) -> Result<()> {
+    async fn finalize_draft(&self, _recipient: &str, message_id: &str, text: &str) -> Result<()> {
         update_activity(&self.ctx, message_id, text).await
     }
 }
@@ -338,7 +361,10 @@ async fn post_activity(
 /// Build the activities URL for a conversation.
 fn activities_url(ctx: &TeamsContext) -> String {
     let base_url = normalize_service_url(&ctx.service_url);
-    format!("{}/v3/conversations/{}/activities", base_url, ctx.conversation_id)
+    format!(
+        "{}/v3/conversations/{}/activities",
+        base_url, ctx.conversation_id
+    )
 }
 
 /// Build the `from` account for activities.
@@ -371,11 +397,14 @@ pub async fn send_reply(ctx: &TeamsContext, text: &str) -> Result<String> {
     };
 
     let resp = post_activity(
-        ctx, &url, &activity,
+        ctx,
+        &url,
+        &activity,
         reqwest::Method::POST,
         Duration::from_secs(15),
         "Failed to send Teams reply",
-    ).await?;
+    )
+    .await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -408,11 +437,14 @@ pub async fn send_card_activity(ctx: &TeamsContext, card: serde_json::Value) -> 
     };
 
     let resp = post_activity(
-        ctx, &url, &activity,
+        ctx,
+        &url,
+        &activity,
         reqwest::Method::POST,
         Duration::from_secs(15),
         "Failed to send Teams card",
-    ).await?;
+    )
+    .await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -447,11 +479,14 @@ pub async fn update_activity(ctx: &TeamsContext, activity_id: &str, text: &str) 
     };
 
     let resp = post_activity(
-        ctx, &url, &activity,
+        ctx,
+        &url,
+        &activity,
         reqwest::Method::PUT,
         Duration::from_secs(15),
         "Failed to update Teams activity",
-    ).await?;
+    )
+    .await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -476,11 +511,14 @@ pub async fn send_typing(ctx: &TeamsContext) -> Result<()> {
     };
 
     let resp = post_activity(
-        ctx, &url, &activity,
+        ctx,
+        &url,
+        &activity,
         reqwest::Method::POST,
         Duration::from_secs(10),
         "Failed to send Teams typing indicator",
-    ).await?;
+    )
+    .await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -514,6 +552,78 @@ pub fn spawn_typing_loop(ctx: TeamsContext) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Adaptive Card extraction
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Try to extract an Adaptive Card JSON from the agent response text.
+///
+/// LLMs return Adaptive Cards in various forms:
+/// 1. Raw JSON: `{"type": "AdaptiveCard", ...}`
+/// 2. Wrapped in a markdown code block: ````json\n{...}\n````
+/// 3. Code block with surrounding text: `Here's your card:\n```json\n{...}\n```\nEnjoy!`
+///
+/// Returns `Some((card_json, remaining_text))` if found.
+/// `remaining_text` is any text outside the code block (may be empty).
+pub fn extract_adaptive_card(text: &str) -> Option<(serde_json::Value, String)> {
+    let trimmed = text.trim();
+
+    // Try raw JSON first (entire response is the card)
+    if let Some(card) = try_parse_adaptive_card(trimmed) {
+        return Some((card, String::new()));
+    }
+
+    // Find a markdown code block anywhere in the text and check if it's an Adaptive Card.
+    // Scan for ``` boundaries — handles ```json, ```, etc.
+    let mut search_from = 0;
+    while let Some(start) = trimmed[search_from..].find("```") {
+        let abs_start = search_from + start;
+        // Skip past the opening ``` and any language tag (e.g., "json")
+        let after_backticks = abs_start + 3;
+        // Find the end of the opening line (language hint)
+        let content_start = trimmed[after_backticks..]
+            .find('\n')
+            .map(|i| after_backticks + i + 1)
+            .unwrap_or(after_backticks);
+
+        // Find closing ```
+        if let Some(end_offset) = trimmed[content_start..].find("```") {
+            let content_end = content_start + end_offset;
+            let inner = trimmed[content_start..content_end].trim();
+
+            if let Some(card) = try_parse_adaptive_card(inner) {
+                // Collect text before and after the code block
+                let block_end = content_end + 3;
+                let before = trimmed[..abs_start].trim();
+                let after = trimmed[block_end..].trim();
+                let remaining = match (before.is_empty(), after.is_empty()) {
+                    (true, true) => String::new(),
+                    (false, true) => before.to_string(),
+                    (true, false) => after.to_string(),
+                    (false, false) => format!("{before}\n{after}"),
+                };
+                return Some((card, remaining));
+            }
+
+            // Not an Adaptive Card, keep searching after this block
+            search_from = content_end + 3;
+        } else {
+            break;
+        }
+    }
+
+    None
+}
+
+fn try_parse_adaptive_card(text: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    if value.get("type")?.as_str()? == "AdaptiveCard" {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -653,7 +763,10 @@ mod tests {
             reply_to_id: None,
         };
         let json = serde_json::to_value(&activity).unwrap();
-        assert_eq!(json["attachments"][0]["contentType"], "application/vnd.microsoft.card.adaptive");
+        assert_eq!(
+            json["attachments"][0]["contentType"],
+            "application/vnd.microsoft.card.adaptive"
+        );
         assert_eq!(json["attachments"][0]["content"]["type"], "AdaptiveCard");
     }
 
@@ -674,5 +787,105 @@ mod tests {
         let channel = TeamsChannel::new(ctx);
         assert_eq!(channel.name(), "teams");
         assert!(channel.supports_draft_updates());
+    }
+
+    // ── Adaptive Card extraction tests ──
+
+    #[test]
+    fn extract_adaptive_card_raw_json() {
+        let text = r#"{"type": "AdaptiveCard", "version": "1.5", "body": []}"#;
+        let (card, remaining) = extract_adaptive_card(text).unwrap();
+        assert_eq!(card["type"], "AdaptiveCard");
+        assert_eq!(card["version"], "1.5");
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn extract_adaptive_card_markdown_code_block() {
+        let text = "```json\n{\"type\": \"AdaptiveCard\", \"version\": \"1.5\", \"body\": []}\n```";
+        let (card, remaining) = extract_adaptive_card(text).unwrap();
+        assert_eq!(card["type"], "AdaptiveCard");
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn extract_adaptive_card_plain_code_block() {
+        let text = "```\n{\"type\": \"AdaptiveCard\", \"version\": \"1.5\", \"body\": []}\n```";
+        let (card, remaining) = extract_adaptive_card(text).unwrap();
+        assert_eq!(card["type"], "AdaptiveCard");
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn extract_adaptive_card_with_surrounding_text() {
+        let text = "Here's your card:\n```json\n{\"type\": \"AdaptiveCard\", \"version\": \"1.5\", \"body\": []}\n```\nUpdated the title!";
+        let (card, remaining) = extract_adaptive_card(text).unwrap();
+        assert_eq!(card["type"], "AdaptiveCard");
+        assert_eq!(remaining, "Here's your card:\nUpdated the title!");
+    }
+
+    #[test]
+    fn extract_adaptive_card_text_only_after() {
+        let text = "```json\n{\"type\": \"AdaptiveCard\", \"version\": \"1.5\", \"body\": []}\n```\nEnjoy!";
+        let (card, remaining) = extract_adaptive_card(text).unwrap();
+        assert_eq!(card["type"], "AdaptiveCard");
+        assert_eq!(remaining, "Enjoy!");
+    }
+
+    #[test]
+    fn extract_adaptive_card_not_a_card() {
+        assert!(extract_adaptive_card("Hello, how can I help?").is_none());
+        assert!(extract_adaptive_card(r#"{"type": "other", "data": 1}"#).is_none());
+        assert!(extract_adaptive_card("```json\n{\"key\": \"value\"}\n```").is_none());
+    }
+
+    #[test]
+    fn extract_adaptive_card_with_whitespace() {
+        let text = "  \n{\"type\": \"AdaptiveCard\", \"version\": \"1.5\", \"body\": []}\n  ";
+        let (card, _) = extract_adaptive_card(text).unwrap();
+        assert_eq!(card["type"], "AdaptiveCard");
+    }
+
+    // ── Reply channel factory tests ──
+
+    #[test]
+    fn try_from_reply_channel_valid() {
+        let value = serde_json::json!({
+            "service_url": "https://smba.trafficmanager.net/teams/",
+            "conversation_id": "conv-123",
+            "app_id": "app-id",
+            "app_password": "app-password"
+        });
+        let ch = TeamsChannel::try_from_reply_channel(&value);
+        assert!(ch.is_some());
+        assert_eq!(ch.unwrap().name(), "teams");
+    }
+
+    #[test]
+    fn try_from_reply_channel_empty_service_url() {
+        let value = serde_json::json!({
+            "service_url": "",
+            "conversation_id": "conv-123",
+            "app_id": "app-id",
+            "app_password": "app-password"
+        });
+        assert!(TeamsChannel::try_from_reply_channel(&value).is_none());
+    }
+
+    #[test]
+    fn try_from_reply_channel_empty_app_id() {
+        let value = serde_json::json!({
+            "service_url": "https://smba.trafficmanager.net/teams/",
+            "conversation_id": "conv-123",
+            "app_id": "",
+            "app_password": "app-password"
+        });
+        assert!(TeamsChannel::try_from_reply_channel(&value).is_none());
+    }
+
+    #[test]
+    fn try_from_reply_channel_invalid_json() {
+        let value = serde_json::json!({"foo": "bar"});
+        assert!(TeamsChannel::try_from_reply_channel(&value).is_none());
     }
 }
