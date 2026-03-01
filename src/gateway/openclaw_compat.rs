@@ -138,6 +138,11 @@ pub async fn handle_api_chat(
     };
 
     let message = chat_body.message.trim();
+    let session_id = chat_body
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     if message.is_empty() {
         let err = serde_json::json!({ "error": "Message cannot be empty" });
         return (StatusCode::BAD_REQUEST, Json(err));
@@ -148,7 +153,7 @@ pub async fn handle_api_chat(
         let key = api_chat_memory_key();
         let _ = state
             .mem
-            .store(&key, message, MemoryCategory::Conversation, None)
+            .store(&key, message, MemoryCategory::Conversation, session_id)
             .await;
     }
 
@@ -199,7 +204,7 @@ pub async fn handle_api_chat(
         // Start typing indicator (repeats every 3s until aborted)
         let typing_handle = teams_reply::spawn_typing_loop(teams_ctx.clone());
 
-        let result = run_gateway_chat_with_tools(&state, &enriched_message).await;
+        let result = run_gateway_chat_with_tools(&state, &enriched_message, session_id).await;
 
         // Stop typing
         typing_handle.abort();
@@ -316,7 +321,7 @@ pub async fn handle_api_chat(
     }
 
     // ── Run the full agent loop (non-Teams path) ──
-    match run_gateway_chat_with_tools(&state, &enriched_message).await {
+    match run_gateway_chat_with_tools(&state, &enriched_message, session_id).await {
         Ok(response) => {
             let leak_guard_cfg = state.config.lock().security.outbound_leak_guard.clone();
             let safe_response = sanitize_gateway_response(
@@ -649,6 +654,11 @@ pub async fn handle_v1_chat_completions_with_tools(
     };
 
     let is_stream = request.stream.unwrap_or(false);
+    let session_id = request
+        .user
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let request_id = format!("chatcmpl-{}", Uuid::new_v4().to_string().replace('-', ""));
     let created = unix_timestamp();
 
@@ -657,7 +667,7 @@ pub async fn handle_v1_chat_completions_with_tools(
         let key = api_chat_memory_key();
         let _ = state
             .mem
-            .store(&key, &message, MemoryCategory::Conversation, None)
+            .store(&key, &message, MemoryCategory::Conversation, session_id)
             .await;
     }
 
@@ -692,7 +702,7 @@ pub async fn handle_v1_chat_completions_with_tools(
     );
 
     // ── Run the full agent loop ──
-    let reply = match run_gateway_chat_with_tools(&state, &enriched_message).await {
+    let reply = match run_gateway_chat_with_tools(&state, &enriched_message, session_id).await {
         Ok(response) => {
             let leak_guard_cfg = state.config.lock().security.outbound_leak_guard.clone();
             let safe = sanitize_gateway_response(

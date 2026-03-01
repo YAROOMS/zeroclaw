@@ -1,5 +1,6 @@
+use super::ack_reaction::{select_ack_reaction, AckReactionContext, AckReactionContextChatType};
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use crate::config::{Config, StreamMode};
+use crate::config::{AckReactionConfig, Config, StreamMode};
 use crate::security::pairing::PairingGuard;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -432,7 +433,13 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
         });
 
         if let Some(attachment) = parsed {
-            attachments.push(attachment);
+            // Skip duplicate targets — LLMs sometimes emit repeated markers in one reply.
+            if !attachments
+                .iter()
+                .any(|a: &TelegramAttachment| a.target == attachment.target)
+            {
+                attachments.push(attachment);
+            }
         } else {
             cleaned.push_str(&message[open..=close]);
         }
@@ -467,6 +474,7 @@ pub struct TelegramChannel {
     workspace_dir: Option<std::path::PathBuf>,
     /// Whether to send emoji reaction acknowledgments to incoming messages.
     ack_enabled: bool,
+    ack_reaction: Option<AckReactionConfig>,
 }
 
 impl TelegramChannel {
@@ -504,6 +512,7 @@ impl TelegramChannel {
             transcription: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
+            ack_reaction: None,
             ack_enabled,
         }
     }
@@ -511,6 +520,12 @@ impl TelegramChannel {
     /// Configure workspace directory for saving downloaded attachments.
     pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.workspace_dir = Some(dir);
+        self
+    }
+
+    /// Configure ACK reaction policy.
+    pub fn with_ack_reaction(mut self, ack_reaction: Option<AckReactionConfig>) -> Self {
+        self.ack_reaction = ack_reaction;
         self
     }
 
@@ -574,7 +589,9 @@ impl TelegramChannel {
         body
     }
 
-    fn extract_update_message_target(update: &serde_json::Value) -> Option<(String, i64)> {
+    fn extract_update_message_ack_target(
+        update: &serde_json::Value,
+    ) -> Option<(String, i64, AckReactionContextChatType, Option<String>)> {
         let message = update.get("message")?;
         let chat_id = message
             .get("chat")
@@ -584,7 +601,30 @@ impl TelegramChannel {
         let message_id = message
             .get("message_id")
             .and_then(serde_json::Value::as_i64)?;
-        Some((chat_id, message_id))
+        let chat_type = message
+            .get("chat")
+            .and_then(|chat| chat.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .map(|kind| {
+                if kind == "group" || kind == "supergroup" {
+                    AckReactionContextChatType::Group
+                } else {
+                    AckReactionContextChatType::Direct
+                }
+            })
+            .unwrap_or(AckReactionContextChatType::Direct);
+        let sender_id = message
+            .get("from")
+            .and_then(|sender| sender.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|value| value.to_string());
+        Some((chat_id, message_id, chat_type, sender_id))
+    }
+
+    #[cfg(test)]
+    fn extract_update_message_target(update: &serde_json::Value) -> Option<(String, i64)> {
+        Self::extract_update_message_ack_target(update)
+            .map(|(chat_id, message_id, _, _)| (chat_id, message_id))
     }
 
     fn parse_approval_callback_command(data: &str) -> Option<String> {
@@ -698,14 +738,12 @@ impl TelegramChannel {
         })
     }
 
-    fn try_add_ack_reaction_nonblocking(&self, chat_id: String, message_id: i64) {
+    fn try_add_ack_reaction_nonblocking(&self, chat_id: String, message_id: i64, emoji: String) {
         if !self.ack_enabled {
             return;
         }
-
         let client = self.http_client();
         let url = self.api_url("setMessageReaction");
-        let emoji = random_telegram_ack_reaction().to_string();
         let body = build_telegram_ack_reaction_request(&chat_id, message_id, &emoji);
 
         tokio::spawn(async move {
@@ -765,7 +803,7 @@ impl TelegramChannel {
     }
 
     fn log_poll_transport_error(sanitized: &str, consecutive_failures: u32) {
-        if consecutive_failures >= 6 && consecutive_failures % 6 == 0 {
+        if consecutive_failures >= 6 && consecutive_failures.is_multiple_of(6) {
             tracing::warn!(
                 "Telegram poll transport error persists (consecutive={}): {}",
                 consecutive_failures,
@@ -3109,8 +3147,8 @@ impl Channel for TelegramChannel {
         let thread_id = parsed_thread_id.or(thread_ts);
 
         let raw_args = arguments.to_string();
-        let args_preview = if raw_args.len() > 260 {
-            format!("{}...", &raw_args[..260])
+        let args_preview = if raw_args.chars().count() > 260 {
+            crate::util::truncate_with_ellipsis(&raw_args, 260)
         } else {
             raw_args
         };
@@ -3334,13 +3372,27 @@ Ensure only one `zeroclaw` process is using this bot token."
                         continue;
                     };
 
-                    if let Some((reaction_chat_id, reaction_message_id)) =
-                        Self::extract_update_message_target(update)
+                    if let Some((reaction_chat_id, reaction_message_id, chat_type, sender_id)) =
+                        Self::extract_update_message_ack_target(update)
                     {
-                        self.try_add_ack_reaction_nonblocking(
-                            reaction_chat_id,
-                            reaction_message_id,
-                        );
+                        let reaction_ctx = AckReactionContext {
+                            text: &msg.content,
+                            sender_id: sender_id.as_deref(),
+                            chat_id: Some(&reaction_chat_id),
+                            chat_type,
+                            locale_hint: None,
+                        };
+                        if let Some(emoji) = select_ack_reaction(
+                            self.ack_reaction.as_ref(),
+                            TELEGRAM_ACK_REACTIONS,
+                            &reaction_ctx,
+                        ) {
+                            self.try_add_ack_reaction_nonblocking(
+                                reaction_chat_id,
+                                reaction_message_id,
+                                emoji,
+                            );
+                        }
                     }
 
                     // Send "typing" indicator immediately when we receive a message
@@ -3766,6 +3818,17 @@ mod tests {
         assert_eq!(attachments[0].target, "/tmp/a.png");
         assert_eq!(attachments[1].kind, TelegramAttachmentKind::Document);
         assert_eq!(attachments[1].target, "https://example.com/a.pdf");
+    }
+
+    #[test]
+    fn parse_attachment_markers_deduplicates_duplicate_targets() {
+        let message = "twice [IMAGE:/tmp/a.png] then again [IMAGE:/tmp/a.png] end";
+        let (cleaned, attachments) = parse_attachment_markers(message);
+
+        assert_eq!(cleaned, "twice  then again  end");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].kind, TelegramAttachmentKind::Image);
+        assert_eq!(attachments[0].target, "/tmp/a.png");
     }
 
     #[test]

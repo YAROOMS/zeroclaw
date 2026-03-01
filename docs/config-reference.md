@@ -14,9 +14,12 @@ ZeroClaw logs the resolved config on startup at `INFO` level:
 
 - `Config loaded` with fields: `path`, `workspace`, `source`, `initialized`
 
-Schema export command:
+CLI commands for config inspection and modification:
 
-- `zeroclaw config schema` (prints JSON Schema draft 2020-12 to stdout)
+- `zeroclaw config show` — print effective config as JSON (secrets masked)
+- `zeroclaw config get <key>` — query a value by dot-path (e.g. `zeroclaw config get gateway.port`)
+- `zeroclaw config set <key> <value>` — update a value and save to `config.toml`
+- `zeroclaw config schema` — print JSON Schema (draft 2020-12) to stdout
 
 ## Core Keys
 
@@ -34,6 +37,38 @@ Notes:
 - `model_support_vision = false` forces vision support off.
 - Unset keeps the provider's built-in default.
 - Environment override: `ZEROCLAW_MODEL_SUPPORT_VISION` or `MODEL_SUPPORT_VISION` (values: `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`).
+
+## `[model_providers.<profile>]`
+
+Use named profiles to map a logical provider id to a provider name/base URL and optional profile-scoped credentials.
+
+| Key | Default | Notes |
+|---|---|---|
+| `name` | unset | Optional provider id override (for example `openai`, `openai-codex`) |
+| `base_url` | unset | Optional OpenAI-compatible endpoint URL |
+| `wire_api` | unset | Optional protocol mode: `responses` or `chat_completions` |
+| `model` | unset | Optional profile-scoped default model |
+| `api_key` | unset | Optional profile-scoped API key (used when top-level `api_key` is empty) |
+| `requires_openai_auth` | `false` | Load OpenAI auth material (`OPENAI_API_KEY` / Codex auth file) |
+
+Notes:
+
+- If both top-level `api_key` and profile `api_key` are present, top-level `api_key` wins.
+- If top-level `default_model` is still the global OpenRouter default, profile `model` is used as an automatic compatibility override.
+- Secrets encryption applies to profile API keys when `secrets.encrypt = true`.
+
+Example:
+
+```toml
+default_provider = "sub2api"
+
+[model_providers.sub2api]
+name = "sub2api"
+base_url = "https://api.example.com/v1"
+wire_api = "chat_completions"
+model = "qwen-max"
+api_key = "sk-profile-key"
+```
 
 ## `[observability]`
 
@@ -501,6 +536,7 @@ Notes:
 |---|---|---|
 | `open_skills_enabled` | `false` | Opt-in loading/sync of community `open-skills` repository |
 | `open_skills_dir` | unset | Optional local path for `open-skills` (defaults to `$HOME/open-skills` when enabled) |
+| `trusted_skill_roots` | `[]` | Allowlist of directory roots for symlink targets in `workspace/skills/*` |
 | `prompt_injection_mode` | `full` | Skill prompt verbosity: `full` (inline instructions/tools) or `compact` (name/description/location only) |
 | `clawhub_token` | unset | Optional Bearer token for authenticated ClawhHub skill downloads |
 
@@ -513,7 +549,8 @@ Notes:
   - `ZEROCLAW_SKILLS_PROMPT_MODE` accepts `full` or `compact`.
 - Precedence for enable flag: `ZEROCLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` in `config.toml` → default `false`.
 - `prompt_injection_mode = "compact"` is recommended on low-context local models to reduce startup prompt size while keeping skill files available on demand.
-- Skill loading and `zeroclaw skills install` both apply a static security audit. Skills that contain symlinks, script-like files, high-risk shell payload snippets, or unsafe markdown link traversal are rejected.
+- Symlinked workspace skills are blocked by default. Set `trusted_skill_roots` to allow local shared-skill directories after explicit trust review.
+- `zeroclaw skills install` and `zeroclaw skills audit` apply a static security audit. Skills that contain script-like files, high-risk shell payload snippets, or unsafe markdown link traversal are rejected.
 - `clawhub_token` is sent as `Authorization: Bearer <token>` when downloading from ClawhHub. Obtain a token from [https://clawhub.ai](https://clawhub.ai) after signing in. Required if the API returns 429 (rate-limited) or 401 (unauthorized) for anonymous requests.
 
 **ClawhHub token example:**
@@ -888,6 +925,17 @@ allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
 Notes:
 
 - Memory context injection ignores legacy `assistant_resp*` auto-save keys to prevent old model-authored summaries from being treated as facts.
+- Observation memory is available via tool `memory_observe`, which stores entries under category `observation` by default (override with `category` when needed).
+
+Example (tool-call payload):
+
+```json
+{
+  "observation": "User asks for brief release notes when CI is green.",
+  "source": "chat",
+  "confidence": 0.9
+}
+```
 
 ## `[[model_routes]]` and `[[embedding_routes]]`
 
@@ -1017,9 +1065,69 @@ Notes:
   - `mode = "all_messages"` or `mode = "mention_only"`
   - `allowed_sender_ids = ["..."]` to bypass mention gating in groups
   - `allowed_users` allowlist checks still run first
+- Telegram/Discord/Lark/Feishu ACK emoji reactions are configurable under
+  `[channels_config.ack_reaction.<channel>]` with switchable enable state,
+  custom emoji pools, and conditional rules.
 - Legacy `mention_only` flags (Telegram/Discord/Mattermost/Lark) remain supported as fallback only.
   If `group_reply.mode` is set, it takes precedence over legacy `mention_only`.
 - While `zeroclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
+
+### `[channels_config.ack_reaction.<channel>]`
+
+Per-channel ACK reaction policy (`<channel>`: `telegram`, `discord`, `lark`, `feishu`).
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Master switch for ACK reactions on this channel |
+| `strategy` | `random` | Pool selection strategy: `random` or `first` |
+| `sample_rate` | `1.0` | Probabilistic gate in `[0.0, 1.0]` for channel fallback ACKs |
+| `emojis` | `[]` | Channel-level custom fallback pool (uses built-in pool when empty) |
+| `rules` | `[]` | Ordered conditional rules; first matching rule can react or suppress |
+
+Rule object fields (`[[channels_config.ack_reaction.<channel>.rules]]`):
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Enable/disable this single rule |
+| `contains_any` | `[]` | Match when message contains any keyword (case-insensitive) |
+| `contains_all` | `[]` | Match when message contains all keywords (case-insensitive) |
+| `contains_none` | `[]` | Match only when message contains none of these keywords |
+| `regex_any` | `[]` | Match when any regex pattern matches |
+| `regex_all` | `[]` | Match only when all regex patterns match |
+| `regex_none` | `[]` | Match only when none of these regex patterns match |
+| `sender_ids` | `[]` | Match only these sender IDs (`"*"` matches all) |
+| `chat_ids` | `[]` | Match only these chat/channel IDs (`"*"` matches all) |
+| `chat_types` | `[]` | Restrict to `group` and/or `direct` |
+| `locale_any` | `[]` | Restrict by locale tag (prefix supported, e.g. `zh`) |
+| `action` | `react` | `react` to emit ACK, `suppress` to force no ACK when matched |
+| `sample_rate` | unset | Optional rule-level gate in `[0.0, 1.0]` (overrides channel `sample_rate`) |
+| `strategy` | unset | Optional per-rule strategy override |
+| `emojis` | `[]` | Emoji pool used when this rule matches |
+
+Example:
+
+```toml
+[channels_config.ack_reaction.telegram]
+enabled = true
+strategy = "random"
+sample_rate = 1.0
+emojis = ["✅", "👌", "🔥"]
+
+[[channels_config.ack_reaction.telegram.rules]]
+contains_any = ["deploy", "release"]
+contains_none = ["dry-run"]
+regex_none = ["panic|fatal"]
+chat_ids = ["-100200300"]
+chat_types = ["group"]
+strategy = "first"
+sample_rate = 0.9
+emojis = ["🚀"]
+
+[[channels_config.ack_reaction.telegram.rules]]
+contains_any = ["error", "failed"]
+action = "suppress"
+sample_rate = 1.0
+```
 
 ### `[channels_config.nostr]`
 
