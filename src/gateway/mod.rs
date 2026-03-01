@@ -12,7 +12,6 @@ mod openai_compat;
 mod openclaw_compat;
 pub mod sse;
 pub mod static_files;
-pub mod teams_reply;
 pub mod ws;
 
 use crate::channels::{
