@@ -3932,10 +3932,18 @@ pub async fn run(
             format!("{context}[{now}] {effective_msg}")
         };
 
-        let mut history = vec![
-            ChatMessage::system(&system_prompt),
-            ChatMessage::user(&enriched),
-        ];
+        // Load conversation history from session file when available.
+        // This enables multi-turn conversations across /api/chat calls.
+        let mut history = if let Some(path) = session_state_file.as_deref() {
+            let mut h = load_interactive_session_history(path, &system_prompt)?;
+            h.push(ChatMessage::user(&enriched));
+            h
+        } else {
+            vec![
+                ChatMessage::system(&system_prompt),
+                ChatMessage::user(&enriched),
+            ]
+        };
 
         // Prune history for token efficiency (when enabled).
         if config.agent.history_pruning.enabled {
@@ -4044,6 +4052,13 @@ pub async fn run(
                 }
             }
         }
+        // Save conversation history for multi-turn session persistence.
+        if let Some(path) = session_state_file.as_deref() {
+            if let Err(e) = save_interactive_session_history(path, &history) {
+                tracing::warn!("Failed to save session history: {e}");
+            }
+        }
+
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
