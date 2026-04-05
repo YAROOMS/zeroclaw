@@ -128,16 +128,12 @@ impl Channel for TeamsChannel {
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
         if let Some((card, remaining)) = extract_adaptive_card(&message.content) {
-            send_card_activity(&self.ctx, card).await?;
-            // Drop any text surrounding the card — the card IS the response.
-            // LLMs often wrap cards with narration ("Here's your card:", "Let me
-            // compile...") which would appear as an ugly second message in Teams.
+            // Send surrounding text as a separate message first (if any),
+            // then send the card alone so Teams renders it properly.
             if !remaining.is_empty() {
-                tracing::debug!(
-                    "Dropped {} chars of surrounding text after Adaptive Card extraction",
-                    remaining.len()
-                );
+                send_reply(&self.ctx, &remaining).await?;
             }
+            send_card_activity(&self.ctx, card).await?;
         } else {
             send_reply(&self.ctx, &message.content).await?;
         }
