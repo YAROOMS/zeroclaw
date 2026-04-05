@@ -29,6 +29,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -52,6 +53,27 @@ pub struct ApiChatBody {
 
 fn api_chat_memory_key() -> String {
     format!("api_chat_msg_{}", Uuid::new_v4())
+}
+
+/// Derive a session state file path from a session ID.
+/// This enables conversation history persistence across `/api/chat` calls
+/// with the same session_id, matching how channels maintain history.
+fn session_state_path(config: &crate::config::Config, session_id: Option<&str>) -> Option<PathBuf> {
+    let sid = session_id?;
+    if sid.is_empty() {
+        return None;
+    }
+    // Sanitize session ID for use as filename (replace non-alphanumeric with _)
+    let safe_id: String = sid
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let dir = PathBuf::from(&config.workspace_dir)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("sessions")
+        .join("api_chat");
+    Some(dir.join(format!("{safe_id}.json")))
 }
 
 /// Record LlmResponse + RequestLatency + AgentEnd observability events.
@@ -90,12 +112,37 @@ fn record_completion(
 }
 
 /// Sanitize an agent response before sending to the caller.
-///
-/// Uses the channel sanitizer (tool-artifact stripping + credential leak guard).
-/// We pass an empty tools list since the gateway doesn't have access to the
-/// instantiated tools registry; the leak detector still runs unconditionally.
 fn sanitize_response(response: &str) -> String {
     crate::channels::sanitize_channel_response(response, &[])
+}
+
+/// Run the agent loop with session history persistence.
+///
+/// If a `session_id` is provided, conversation history is loaded from and saved
+/// to a session file, enabling multi-turn conversations across `/api/chat` calls.
+/// This matches how channels (Telegram, Discord, etc.) maintain per-sender history.
+async fn run_with_session(
+    config: crate::config::Config,
+    message: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<String> {
+    let session_path = session_state_path(&config, session_id);
+
+    // Use the full `run()` function with a session state file when available.
+    // This loads prior conversation history and saves after the turn,
+    // matching channel behavior.
+    Box::pin(crate::agent::run(
+        config,
+        Some(message.to_string()),
+        None,  // provider_override
+        None,  // model_override
+        -1.0,  // temperature (-1 = use config default)
+        vec![], // peripheral_overrides
+        false, // interactive (false = non-interactive/daemon mode)
+        session_path,
+        None,  // allowed_tools
+    ))
+    .await
 }
 
 /// `POST /api/chat` — full agent loop with tools and memory.
@@ -214,8 +261,6 @@ pub async fn handle_api_chat(
         });
 
     // ── Channel direct reply path ──
-    // When a reply channel is present, send replies directly via the channel
-    // instead of returning them in the HTTP response body.
     let reply_channel: Option<Box<dyn Channel>> = chat_body
         .reply_channel
         .as_ref()
@@ -225,8 +270,7 @@ pub async fn handle_api_chat(
         let _ = ch.start_typing("").await;
 
         let config = state.config.lock().clone();
-        let result =
-            Box::pin(crate::agent::process_message(config, message, session_id)).await;
+        let result = run_with_session(config, message, session_id).await;
 
         let _ = ch.stop_typing("").await;
 
@@ -269,7 +313,6 @@ pub async fn handle_api_chat(
 
                 tracing::error!("/api/chat provider error (channel path): {sanitized}");
 
-                // Best-effort error reply via channel
                 let msg = crate::channels::SendMessage::new(
                     "Sorry, I couldn't process your message. Please try again.",
                     "",
@@ -287,7 +330,7 @@ pub async fn handle_api_chat(
 
     // ── Run the full agent loop (non-channel path) ──
     let config = state.config.lock().clone();
-    match Box::pin(crate::agent::process_message(config, message, session_id)).await {
+    match run_with_session(config, message, session_id).await {
         Ok(response) => {
             let safe_response = sanitize_response(&response);
             let duration = started_at.elapsed();
