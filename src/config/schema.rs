@@ -6108,6 +6108,9 @@ pub struct ChannelsConfig {
     pub wati: Option<WatiConfig>,
     /// Nextcloud Talk bot channel configuration.
     pub nextcloud_talk: Option<NextcloudTalkConfig>,
+    /// Microsoft Teams channel configuration.
+    /// Teams operates in send-only mode; credentials arrive per-request from the router.
+    pub teams: Option<TeamsConfig>,
     /// Email channel configuration.
     pub email: Option<crate::channels::email_channel::EmailConfig>,
     /// Gmail Pub/Sub push notification channel configuration.
@@ -6322,6 +6325,7 @@ impl Default for ChannelsConfig {
             linq: None,
             wati: None,
             nextcloud_talk: None,
+            teams: None,
             email: None,
             gmail_push: None,
             irc: None,
@@ -6948,6 +6952,27 @@ impl ChannelConfig for NextcloudTalkConfig {
     }
     fn desc() -> &'static str {
         "NextCloud Talk platform"
+    }
+}
+
+/// Microsoft Teams channel configuration.
+///
+/// Teams operates in a webhook/send-only model: an external router forwards
+/// messages via `POST /api/chat` with per-request credentials (`teams_context`).
+/// This config only controls whether the channel is enabled in ZeroClaw.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct TeamsConfig {
+    /// Whether the Teams channel is enabled. Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl ChannelConfig for TeamsConfig {
+    fn name() -> &'static str {
+        "Microsoft Teams"
+    }
+    fn desc() -> &'static str {
+        "Microsoft Teams via Bot Framework"
     }
 }
 
@@ -11512,6 +11537,7 @@ auto_save = true
                 linq: None,
                 wati: None,
                 nextcloud_talk: None,
+                teams: None,
                 email: None,
                 gmail_push: None,
                 irc: None,
@@ -12552,6 +12578,7 @@ allowed_users = ["@ops:matrix.org"]
             linq: None,
             wati: None,
             nextcloud_talk: None,
+            teams: None,
             email: None,
             gmail_push: None,
             irc: None,
@@ -12926,6 +12953,7 @@ channel_ids = ["C123", "D456"]
             linq: None,
             wati: None,
             nextcloud_talk: None,
+            teams: None,
             email: None,
             gmail_push: None,
             irc: None,

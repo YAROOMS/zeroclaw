@@ -48,6 +48,7 @@ pub mod session_store;
 pub mod signal;
 pub mod slack;
 pub mod stall_watchdog;
+pub mod teams;
 pub mod telegram;
 pub mod traits;
 pub mod transcription;
@@ -90,6 +91,7 @@ pub use qq::QQChannel;
 pub use reddit::RedditChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
+pub use teams::TeamsChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
 #[allow(unused_imports)]
@@ -105,6 +107,14 @@ pub use wecom::WeComChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
+
+/// Construct a per-request reply channel from an opaque JSON blob.
+///
+/// The gateway passes an opaque JSON value (e.g. `teams_context` from the router)
+/// and this factory resolves it to a concrete `Channel` implementation.
+pub fn reply_channel_from_json(value: &serde_json::Value) -> Option<Box<dyn Channel>> {
+    teams::TeamsChannel::try_from_reply_channel(value)
+}
 
 use crate::agent::loop_::{
     build_tool_instructions, clear_model_switch_request, get_model_switch_state,
@@ -2009,7 +2019,7 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
-fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
