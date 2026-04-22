@@ -15,8 +15,15 @@
 //! { "message": "...", "session_id": "...", "teams_context": { ... } }
 //! ```
 //!
-//! Response (non-channel): `{ "reply": "...", "model": "..." }`
-//! Response (channel):     `{ "delivered_via_channel": true, "model": "..." }`
+//! Response (non-channel): `{ "reply": "...", "model": "...", "session_id": "..." }`
+//! Response (channel):     `{ "delivered_via_channel": true, "model": "...", "session_id": "..." }`
+//!
+//! On provider error, response adds `"session_reset": bool` — true when the
+//! on-disk session was wiped because the error matched a known poisoning
+//! pattern (tool_use/tool_result pairing, adjacent same-role messages, etc.).
+//!
+//! On `/new` or `/reset` (user-initiated), response adds
+//! `"command": "new"` and `"session_reset": bool`.
 
 use super::{client_key_from_request, AppState, RATE_LIMIT_WINDOW_SECS};
 use crate::channels::traits::Channel;
