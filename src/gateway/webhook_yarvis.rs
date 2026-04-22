@@ -116,6 +116,84 @@ fn sanitize_response(response: &str) -> String {
     crate::channels::sanitize_channel_response(response, &[])
 }
 
+/// Detect error strings that mean the session history on disk is structurally
+/// unusable for this provider (tool_use blocks without matching tool_result,
+/// adjacent same-role messages, etc.). Without repair, every subsequent turn
+/// reloads the same history and hits the same 400, trapping the user in an
+/// endless "Please try again" loop.
+fn is_session_poisoning_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    // Anthropic's well-known failure modes when history is structurally broken.
+    lower.contains("tool_use")
+        || lower.contains("tool_result")
+        || lower.contains("tool_call_id")
+        || lower.contains("messages.")
+        || lower.contains("unexpected `role`")
+}
+
+/// Reset a session by removing its on-disk history file. The next turn with
+/// the same session_id will start fresh. Idempotent: missing file is not an
+/// error. `reason` is logged so operators can tell apart `/new`-initiated
+/// resets from auto-heal resets after provider errors. Returns true if a
+/// file was actually removed.
+fn reset_session_history(
+    config: &crate::config::Config,
+    session_id: Option<&str>,
+    reason: &str,
+) -> bool {
+    let Some(path) = session_state_path(config, session_id) else {
+        return false;
+    };
+    if !path.exists() {
+        return false;
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            tracing::warn!(
+                session_id = session_id.unwrap_or(""),
+                path = %path.display(),
+                reason,
+                "session history reset"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::error!(
+                session_id = session_id.unwrap_or(""),
+                path = %path.display(),
+                reason,
+                error = %e,
+                "failed to reset session history"
+            );
+            false
+        }
+    }
+}
+
+/// User-facing reply for the poisoned-session recovery case. Tells the user
+/// we reset memory without revealing internals. Stays inside SOUL rule 8
+/// ("never mention API behavior in user-facing messages").
+const SESSION_RESET_REPLY: &str =
+    "Something got tangled in my memory of our conversation, so I reset our thread. \
+     Could you send your request again?";
+
+/// Generic fallback for provider errors that don't look like session poisoning
+/// (rate limits, auth, transient network). Advice to "try again" is honest here.
+const TRANSIENT_ERROR_REPLY: &str =
+    "Sorry, I couldn't process your message. Please try again.";
+
+/// Reply when the user explicitly sends `/new` to reset the conversation.
+const NEW_SESSION_REPLY: &str = "Fresh start. What can I help you with?";
+
+/// Detect an explicit user-initiated session reset. Matches `/new` (with or
+/// without trailing whitespace/punctuation). Case-insensitive so `/New` works.
+/// Mirrors upstream's channel-layer `/new` command but operates at the
+/// `/api/chat` surface used by the Yarvis router.
+fn is_new_session_command(message: &str) -> bool {
+    let trimmed = message.trim();
+    trimmed.eq_ignore_ascii_case("/new") || trimmed.eq_ignore_ascii_case("/reset")
+}
+
 /// Run the agent loop with session history persistence.
 ///
 /// If a `session_id` is provided, conversation history is loaded from and saved
@@ -227,6 +305,46 @@ pub async fn handle_api_chat(
         return (StatusCode::BAD_REQUEST, Json(err));
     }
 
+    // ── Explicit session reset via /new or /reset ──
+    // Handled before anything that touches the LLM: the user asked us to
+    // forget the thread, so we clear on-disk history and short-circuit.
+    // Still goes through the reply_channel if Teams provided one.
+    if is_new_session_command(message) {
+        let reset_config = state.config.lock().clone();
+        let reset_happened = reset_session_history(&reset_config, session_id, "user_command");
+        tracing::info!(
+            session_id = session_id.unwrap_or(""),
+            reset = reset_happened,
+            "/api/chat: /new session reset requested"
+        );
+
+        let reply_channel: Option<Box<dyn Channel>> = chat_body
+            .reply_channel
+            .as_ref()
+            .and_then(crate::channels::reply_channel_from_json);
+        if let Some(ref ch) = reply_channel {
+            let msg = crate::channels::SendMessage::new(NEW_SESSION_REPLY, "");
+            let _ = ch.send(&msg).await;
+            let body = serde_json::json!({
+                "delivered_via_channel": true,
+                "model": state.model,
+                "session_id": chat_body.session_id,
+                "session_reset": reset_happened,
+                "command": "new",
+            });
+            return (StatusCode::OK, Json(body));
+        }
+
+        let body = serde_json::json!({
+            "reply": NEW_SESSION_REPLY,
+            "model": state.model,
+            "session_id": chat_body.session_id,
+            "session_reset": reset_happened,
+            "command": "new",
+        });
+        return (StatusCode::OK, Json(body));
+    }
+
     // ── Auto-save to memory ──
     if state.auto_save {
         let key = api_chat_memory_key();
@@ -302,7 +420,8 @@ pub async fn handle_api_chat(
                 return (StatusCode::OK, Json(body));
             }
             Err(e) => {
-                let sanitized = providers::sanitize_api_error(&e.to_string());
+                let raw = e.to_string();
+                let sanitized = providers::sanitize_api_error(&raw);
                 record_completion(
                     &state,
                     &provider_label,
@@ -311,16 +430,27 @@ pub async fn handle_api_chat(
                     Some(&sanitized),
                 );
 
-                tracing::error!("/api/chat provider error (channel path): {sanitized}");
+                let poisoned = is_session_poisoning_error(&raw);
+                let reset_config = state.config.lock().clone();
+                let reset_happened = poisoned && reset_session_history(&reset_config, session_id, "poisoned_history");
 
-                let msg = crate::channels::SendMessage::new(
-                    "Sorry, I couldn't process your message. Please try again.",
-                    "",
+                tracing::error!(
+                    poisoned,
+                    reset = reset_happened,
+                    "/api/chat provider error (channel path): {sanitized}"
                 );
+
+                let reply_text = if reset_happened {
+                    SESSION_RESET_REPLY
+                } else {
+                    TRANSIENT_ERROR_REPLY
+                };
+                let msg = crate::channels::SendMessage::new(reply_text, "");
                 let _ = ch.send(&msg).await;
 
                 let err = serde_json::json!({
                     "error": "LLM request failed",
+                    "session_reset": reset_happened,
                     "delivered_via_channel": true,
                 });
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
@@ -346,7 +476,8 @@ pub async fn handle_api_chat(
         }
         Err(e) => {
             let duration = started_at.elapsed();
-            let sanitized = providers::sanitize_api_error(&e.to_string());
+            let raw = e.to_string();
+            let sanitized = providers::sanitize_api_error(&raw);
 
             record_completion(
                 &state,
@@ -356,9 +487,121 @@ pub async fn handle_api_chat(
                 Some(&sanitized),
             );
 
-            tracing::error!("/api/chat provider error: {sanitized}");
-            let err = serde_json::json!({"error": "LLM request failed"});
+            let poisoned = is_session_poisoning_error(&raw);
+            let reset_config = state.config.lock().clone();
+            let reset_happened = poisoned && reset_session_history(&reset_config, session_id, "poisoned_history");
+
+            tracing::error!(
+                poisoned,
+                reset = reset_happened,
+                "/api/chat provider error: {sanitized}"
+            );
+
+            let err = serde_json::json!({
+                "error": "LLM request failed",
+                "session_reset": reset_happened,
+                "reply": if reset_happened { SESSION_RESET_REPLY } else { TRANSIENT_ERROR_REPLY },
+            });
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_poisoning_detector_catches_tool_use_errors() {
+        // The actual Anthropic 400 from the Camino log.
+        let err = "Anthropic API error (400 Bad Request): {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages.4: `tool_use` ids were found without `tool_result` blocks immediately after: toolu_01KMoWJVyKjAAWJDk4wGm39T. Each `tool_use` block must have a corresponding `tool_result` block in the next message.\"}}";
+        assert!(is_session_poisoning_error(err));
+    }
+
+    #[test]
+    fn session_poisoning_detector_catches_openai_tool_call_id_errors() {
+        let err = "OpenAI error: tool_call_id not found for message";
+        assert!(is_session_poisoning_error(err));
+    }
+
+    #[test]
+    fn session_poisoning_detector_catches_adjacent_role_errors() {
+        let err = "invalid_request_error: messages.2: unexpected `role`: \"assistant\" after \"assistant\"";
+        assert!(is_session_poisoning_error(err));
+    }
+
+    #[test]
+    fn session_poisoning_detector_ignores_rate_limit() {
+        let err = "Anthropic API error (429): rate limit exceeded, retry after 30s";
+        assert!(!is_session_poisoning_error(err));
+    }
+
+    #[test]
+    fn session_poisoning_detector_ignores_auth_errors() {
+        let err = "Anthropic API error (401): invalid x-api-key";
+        assert!(!is_session_poisoning_error(err));
+    }
+
+    #[test]
+    fn session_poisoning_detector_ignores_network_errors() {
+        let err = "connection reset by peer";
+        assert!(!is_session_poisoning_error(err));
+    }
+
+    #[test]
+    fn reset_session_history_removes_file_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let sessions = tmp.path().join("sessions").join("api_chat");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let session_file = sessions.join("sess-123.json");
+        std::fs::write(&session_file, "{\"version\":1,\"history\":[]}").unwrap();
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.clone();
+
+        assert!(session_file.exists());
+        let removed = reset_session_history(&config, Some("sess-123"), "test");
+        assert!(removed);
+        assert!(!session_file.exists());
+    }
+
+    #[test]
+    fn reset_session_history_returns_false_when_no_session_id() {
+        let config = crate::config::Config::default();
+        assert!(!reset_session_history(&config, None, "test"));
+        assert!(!reset_session_history(&config, Some(""), "test"));
+    }
+
+    #[test]
+    fn reset_session_history_returns_false_when_file_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.clone();
+        assert!(!reset_session_history(&config, Some("nonexistent"), "test"));
+    }
+
+    #[test]
+    fn new_session_command_matches_canonical_forms() {
+        assert!(is_new_session_command("/new"));
+        assert!(is_new_session_command("  /new  "));
+        assert!(is_new_session_command("/New"));
+        assert!(is_new_session_command("/NEW"));
+        assert!(is_new_session_command("/reset"));
+        assert!(is_new_session_command("/Reset"));
+    }
+
+    #[test]
+    fn new_session_command_rejects_near_misses() {
+        assert!(!is_new_session_command("new"));
+        assert!(!is_new_session_command("/news"));
+        assert!(!is_new_session_command("/new chat"));
+        assert!(!is_new_session_command("please /new"));
+        assert!(!is_new_session_command("what's new?"));
+        assert!(!is_new_session_command(""));
+        assert!(!is_new_session_command("   "));
     }
 }
