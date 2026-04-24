@@ -218,6 +218,8 @@ fn token_cache() -> &'static Mutex<HashMap<TokenCacheKey, CachedToken>> {
 
 /// Token lifetime buffer — cache tokens for 50 minutes (they're valid ~60 min).
 const TOKEN_CACHE_TTL: Duration = Duration::from_secs(50 * 60);
+const MAX_ACTIONS_PER_SET: usize = 6;
+const MAX_FACTS_PER_SET: usize = 20;
 
 /// Acquire an OAuth token for the Bot Framework REST API.
 ///
@@ -424,6 +426,7 @@ pub async fn send_reply(ctx: &TeamsContext, text: &str) -> Result<String> {
 /// Send an Adaptive Card reply to a Teams conversation. Returns the activity ID.
 pub async fn send_card_activity(ctx: &TeamsContext, card: serde_json::Value) -> Result<String> {
     let url = activities_url(ctx);
+    let card = normalize_teams_card(card);
     let activity = BotActivity {
         r#type: "message",
         text: None,
@@ -627,6 +630,57 @@ fn try_parse_adaptive_card(text: &str) -> Option<serde_json::Value> {
     }
 }
 
+fn normalize_teams_card(mut card: serde_json::Value) -> serde_json::Value {
+    let truncated = normalize_card_node(&mut card);
+    if truncated > 0 {
+        let note = serde_json::json!({
+            "type": "TextBlock",
+            "text": format!(
+                "{} additional option{} not shown. Reply with the room or desk name to book another option.",
+                truncated,
+                if truncated == 1 { "" } else { "s" }
+            ),
+            "wrap": true,
+            "isSubtle": true,
+            "spacing": "Medium"
+        });
+
+        if let Some(body) = card.get_mut("body").and_then(|v| v.as_array_mut()) {
+            body.push(note);
+        } else if let Some(obj) = card.as_object_mut() {
+            obj.insert("body".to_string(), serde_json::Value::Array(vec![note]));
+        }
+    }
+
+    card
+}
+
+fn normalize_card_node(value: &mut serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(items) => items.iter_mut().map(normalize_card_node).sum(),
+        serde_json::Value::Object(obj) => {
+            let mut truncated = 0;
+
+            if let Some(actions) = obj.get_mut("actions").and_then(|v| v.as_array_mut()) {
+                if actions.len() > MAX_ACTIONS_PER_SET {
+                    truncated += actions.len() - MAX_ACTIONS_PER_SET;
+                    actions.truncate(MAX_ACTIONS_PER_SET);
+                }
+            }
+
+            if let Some(facts) = obj.get_mut("facts").and_then(|v| v.as_array_mut()) {
+                if facts.len() > MAX_FACTS_PER_SET {
+                    truncated += facts.len() - MAX_FACTS_PER_SET;
+                    facts.truncate(MAX_FACTS_PER_SET);
+                }
+            }
+
+            truncated + obj.values_mut().map(normalize_card_node).sum::<usize>()
+        }
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -769,6 +823,46 @@ mod tests {
             "application/vnd.microsoft.card.adaptive"
         );
         assert_eq!(json["attachments"][0]["content"]["type"], "AdaptiveCard");
+    }
+
+    #[test]
+    fn normalize_teams_card_limits_oversized_lists() {
+        let mut facts = Vec::new();
+        for i in 0..25 {
+            facts.push(
+                serde_json::json!({"title": format!("Room {}", i + 1), "value": "Available"}),
+            );
+        }
+        let mut actions = Vec::new();
+        for i in 0..9 {
+            actions.push(serde_json::json!({
+                "type": "Action.Submit",
+                "title": format!("Book Room {}", i + 1),
+                "data": {"msteams": {"type": "messageBack", "text": format!("Book Room {}", i + 1)}}
+            }));
+        }
+
+        let card = serde_json::json!({
+            "type": "AdaptiveCard",
+            "version": "1.5",
+            "body": [
+                {"type": "FactSet", "facts": facts},
+                {"type": "ActionSet", "actions": actions}
+            ]
+        });
+
+        let normalized = normalize_teams_card(card);
+        assert_eq!(normalized["body"][0]["facts"].as_array().unwrap().len(), 20);
+        assert_eq!(
+            normalized["body"][1]["actions"].as_array().unwrap().len(),
+            6
+        );
+        assert!(
+            normalized["body"][2]["text"]
+                .as_str()
+                .unwrap()
+                .contains("8 additional options not shown")
+        );
     }
 
     #[test]
