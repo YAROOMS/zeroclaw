@@ -4946,6 +4946,39 @@ mod tests {
         assert_eq!(history[1].content, "short result");
     }
 
+    #[test]
+    fn fast_trim_preserves_tool_envelope_json() {
+        // Native-tool mode stores tool messages as a JSON envelope:
+        // `{"tool_call_id":"...","content":"..."}`. Trimming the raw string can
+        // insert newlines inside the JSON string value, breaking downstream
+        // parse in convert_messages() → orphaned tool_use blocks → Anthropic 400.
+        let envelope = serde_json::json!({
+            "tool_call_id": "toolu_01Jij4oZG9C4vLjVLS7D5qzz",
+            "content": "x".repeat(10_000),
+        })
+        .to_string();
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::tool(envelope.clone()),
+            ChatMessage::user("recent"),
+            ChatMessage::assistant("recent"),
+        ];
+        let saved = fast_trim_tool_results(&mut history, 2);
+        assert!(saved > 0, "expected trim to shrink the envelope");
+        let parsed: serde_json::Value = serde_json::from_str(&history[1].content)
+            .expect("trimmed envelope must still be valid JSON");
+        assert_eq!(
+            parsed["tool_call_id"], "toolu_01Jij4oZG9C4vLjVLS7D5qzz",
+            "tool_call_id must survive trimming"
+        );
+        let inner = parsed["content"].as_str().expect("content must be a string");
+        assert!(
+            inner.len() < 10_000,
+            "inner content must shrink; got {} chars",
+            inner.len()
+        );
+    }
+
     // ── emergency_history_trim tests ──────────────────────────────
 
     #[test]

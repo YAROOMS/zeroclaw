@@ -221,6 +221,15 @@ const TOKEN_CACHE_TTL: Duration = Duration::from_secs(50 * 60);
 const MAX_ACTIONS_PER_SET: usize = 6;
 const MAX_FACTS_PER_SET: usize = 20;
 
+/// Bot app IDs for which `send_card_activity` should log the full outgoing
+/// Adaptive Card body. Used for diagnosing client-side rendering failures
+/// (e.g., Teams showing "Card - access it on .../cards.unsupported") where
+/// the server-side payload is the only piece of evidence we have.
+const CARD_DEBUG_APP_IDS: &[&str] = &[
+    // caminowellbeing.ca
+    "3d437b94-acd4-43b4-b0ae-e3e08ebe6ce8",
+];
+
 /// Acquire an OAuth token for the Bot Framework REST API.
 ///
 /// Tokens are cached in-memory per `(app_id, tenant_id)` for ~50 minutes.
@@ -439,6 +448,23 @@ pub async fn send_card_activity(ctx: &TeamsContext, card: serde_json::Value) -> 
         recipient: user_account(ctx),
         reply_to_id: ctx.activity_id.clone(),
     };
+
+    if CARD_DEBUG_APP_IDS.contains(&ctx.app_id.as_str()) {
+        match serde_json::to_string(&activity) {
+            Ok(body) => tracing::info!(
+                app_id = %ctx.app_id,
+                conversation_id = %ctx.conversation_id,
+                body_len = body.len(),
+                body = %body,
+                "teams card debug: outgoing attachment body"
+            ),
+            Err(err) => tracing::warn!(
+                app_id = %ctx.app_id,
+                error = %err,
+                "teams card debug: failed to serialize activity for logging"
+            ),
+        }
+    }
 
     let resp = post_activity(
         ctx,
