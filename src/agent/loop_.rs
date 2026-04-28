@@ -2857,6 +2857,19 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            // Models occasionally copy the pruner's "[Tool exchange: …]"
+            // placeholder lines from collapsed history into their own reply.
+            // Strip them so they never reach the end user (or persisted history).
+            let stripped_display =
+                crate::agent::history_pruner::strip_collapsed_markers(&display_text);
+            let stripped_response =
+                crate::agent::history_pruner::strip_collapsed_markers(&response_text);
+            // If stripping removed anything, the already-streamed live draft
+            // contains the bad placeholder text — force the post-hoc rechunk
+            // path so the channel clears and rebuilds the draft from clean text.
+            let strip_dirtied_live_stream = stripped_display != display_text;
+            let display_text = stripped_display;
+            let response_text = stripped_response;
             runtime_trace::record_event(
                 "turn_final_response",
                 Some(channel_name),
@@ -2874,8 +2887,9 @@ pub(crate) async fn run_tool_call_loop(
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
             if let Some(ref tx) = on_delta {
-                let should_emit_post_hoc_chunks =
-                    !response_streamed_live || display_text != response_text;
+                let should_emit_post_hoc_chunks = !response_streamed_live
+                    || display_text != response_text
+                    || strip_dirtied_live_stream;
                 if !should_emit_post_hoc_chunks {
                     history.push(ChatMessage::assistant(response_text.clone()));
                     return Ok(display_text);

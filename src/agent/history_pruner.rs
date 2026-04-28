@@ -85,6 +85,58 @@ fn protected_indices(messages: &[ChatMessage], keep_recent: usize) -> Vec<bool> 
 }
 
 // ---------------------------------------------------------------------------
+// Mimic stripping
+// ---------------------------------------------------------------------------
+
+// When the pruner collapses an assistant+tool group it leaves a placeholder
+// like `[Tool exchange: 2 tool call(s) — results collapsed]` in the assistant
+// message. Models sometimes copy that pattern into their next reply, so the
+// placeholder leaks to the end user. Strip standalone placeholder lines from
+// any text that's about to be surfaced.
+pub fn strip_collapsed_markers(text: &str) -> String {
+    if !text.contains("[Tool exchange:") {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    for line in lines {
+        if !is_collapsed_marker_line(line) {
+            kept.push(line);
+        }
+    }
+    while kept.first().is_some_and(|l| l.trim().is_empty()) {
+        kept.remove(0);
+    }
+    while kept.last().is_some_and(|l| l.trim().is_empty()) {
+        kept.pop();
+    }
+    let mut result = String::with_capacity(text.len());
+    let mut prev_blank = false;
+    for line in &kept {
+        let blank = line.trim().is_empty();
+        if blank && prev_blank {
+            continue;
+        }
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(line);
+        prev_blank = blank;
+    }
+    if text.ends_with('\n') && !result.is_empty() {
+        result.push('\n');
+    }
+    result
+}
+
+fn is_collapsed_marker_line(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with("[Tool exchange:")
+        && t.ends_with("results collapsed]")
+        && t.contains("tool call(s)")
+}
+
+// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
@@ -195,6 +247,42 @@ mod tests {
             role: role.to_string(),
             content: content.to_string(),
         }
+    }
+
+    #[test]
+    fn strip_collapsed_markers_returns_original_when_no_marker() {
+        let text = "Here's what's available at 400 Queen Street.";
+        assert_eq!(strip_collapsed_markers(text), text);
+    }
+
+    #[test]
+    fn strip_collapsed_markers_drops_leading_placeholders() {
+        let input = "[Tool exchange: 1 tool call(s) — results collapsed]\n\n\
+                     [Tool exchange: 1 tool call(s) — results collapsed]\n\n\
+                     Here's what's available at **400 Queen Street**.";
+        let cleaned = strip_collapsed_markers(input);
+        assert_eq!(cleaned, "Here's what's available at **400 Queen Street**.");
+    }
+
+    #[test]
+    fn strip_collapsed_markers_drops_mid_text_placeholders() {
+        let input = "First line.\n\
+                     [Tool exchange: 3 tool call(s) — results collapsed]\n\
+                     Second line.";
+        let cleaned = strip_collapsed_markers(input);
+        assert_eq!(cleaned, "First line.\nSecond line.");
+    }
+
+    #[test]
+    fn strip_collapsed_markers_preserves_trailing_newline() {
+        let input = "[Tool exchange: 2 tool call(s) — results collapsed]\nDone.\n";
+        assert_eq!(strip_collapsed_markers(input), "Done.\n");
+    }
+
+    #[test]
+    fn strip_collapsed_markers_ignores_non_marker_brackets() {
+        let input = "[Tool exchange: see docs]\nReal answer.";
+        assert_eq!(strip_collapsed_markers(input), input);
     }
 
     #[test]
